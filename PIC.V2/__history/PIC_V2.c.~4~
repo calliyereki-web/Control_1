@@ -1,0 +1,278 @@
+#include <18f4550.h>
+#include<stdlib.h>
+#include<math.h>
+#fuses HSPLL,WDT,PUT,NOBROWNOUT,NOLVP,NOWRT,NOPROTECT,NOCPD, PLL5, CPUDIV1
+#use delay(clock=48M,crystal)
+#use rs232(baud=115200,XMIT=PIN_C6,RCV=PIN_C7,BITS=8,PARITY=N)
+
+//------------Direcciones de puertos y registros (Pag. 70 Datasheet)------------//
+#byte PORTB   = 0xF81
+#byte RCSTA   = 0xFAB   // UART Receive Status and Control Register
+#byte TXSTA   = 0xFAC   // UART Transmit Status and Control Register
+#byte RCREG   = 0xFAE   // UART Receive Register
+#byte TXREG   = 0xFAD   // UART Transmit Register
+
+//------------Bits del registro RCSTA------------// (Gemini) -----------------------------------------------------------------------------------------------------
+#bit OERR  = RCSTA.1    // Overrun Error bit
+#bit CREN  = RCSTA.4    // Continuous Receive Enable bit
+#bit FERR  = RCSTA.2    // Framing Error bit
+
+//------------Bits del registro TXSTA------------//
+#bit TRMT  = TXSTA.1    // Transmit Shift Register Status bit (1 = empty)  ---------------------------------------------------------------------------------------------
+
+//------------ CONSTANTES ------------//
+#define MAX_ENCODER  500*4
+#define PR2 240 //FreqPWM=20Khz   PR2= (Tpwm)/((4)(Preescaler)(Tosc))
+#define FW pin_d0       //Pines de sentido
+#define BW pin_d1       //Pines de sentido
+#define CARGAT0 61000   //Freq de muestreo = 1khz, cargaT=((Tiempo)*Fosc)/(4*Preescaler)
+                        //12000 --- Velocidad de muestreo 100 Hz
+                        //61000 --- Velocidad de muestreo 1 KHz
+int1  b_alto = 1, flag=0,flagEnc=0, nueva_instruccion=0;
+
+int16 cuentaEnc,        cuenta,     pos,           duty_recibido;
+
+int8 instruccion[4],    temp
+     posH,              posL,       cuentaEncH,    CuentaEncL,
+     puerto,            BC,         BC_1,          aux,
+     i=0;
+
+int8* pinstruccion = instruccion;
+
+
+//------------Funciones------------//
+void setup();
+void printResults(); //Imprime los resultados: |OxCA|posH|posl|cuentaEncH|cuentaEncL|
+
+
+//------------Aquí se detecta el fakin encoder jajajlol------------//
+//La lógica del encoder es la siguiente:
+//    B7 B6 B5 B4     los bits b7 y b6 no se modifican, solo se usan los b5 y b4
+//    0  0  0  0
+//Giro a la Izquierda 
+//    00 -> 01 -> 11 -> 10 -> 00 ...
+//Giro a la derecha 
+//    00 -> 10 -> 11 -> 01 -> 00 ...
+//    
+//
+//------------Interrupcciones------------//
+#int_rb //Esta es una interrupción que se activa al haber un cambio logico en el puerto B de b4 a B7
+void rb_isr()
+{
+
+puerto=PORTB; 
+
+BC=((puerto)&(0xC0))>>6;
+aux=BC^BC_1;
+if(aux!=0)
+   if(aux!=3)
+   if(((BC_1<<1)^BC)&(0x02))
+   {
+      cuenta--;
+      cuentaEnc++;
+      if(pos < MAX_ENCODER) pos++;
+      else pos=0;
+   }
+   else
+   {
+      cuenta++;
+      cuentaEnc++;
+      if(pos > 0) pos--;
+      else pos=MAX_ENCODER;
+   }
+BC_1=BC;
+FlagEnc=1;
+
+//cuenta_1=cuenta;
+}
+//----------Interrupción Timer0--------------//
+#INT_RTCC
+void timer0(){
+   
+   set_rtcc(CARGAT0);
+  
+   flag=1;
+
+}
+//------------ Interrupción de Recepción Serial ------------//
+#int_rda
+void serial_isr() {
+
+ // --- CRÍTICO: Limpiar error de overrun ---
+    // Si OERR se activa, el UART deja de recibir hasta que se limpie CREN.
+    if (OERR)
+    {
+        CREN = 0;   // Deshabilitar receptor (limpia OERR)
+        CREN = 1;   // Rehabilitar receptor
+    }
+
+    // --- Limpiar error de framing ---
+    // Si hay framing error, descartar el byte y salir.
+    if (FERR)
+    {
+        temp = RCREG; // Leer RCREG para limpiar FERR
+        return;
+    }
+
+   temp = getc();
+   
+   if(temp == 0xCA){
+      pinstruccion = instruccion;
+      *pinstruccion = temp;
+      i = 1;
+   } 
+   else if (i > 0 && i < 4) { // Llenamos los siguientes 3 bytes
+      *(pinstruccion + i) = temp;
+      i++;
+      if(i == 4) {
+         nueva_instruccion = 1;
+         i = 0; // Paquete completo
+      }
+   }
+
+/*
+   temp = getc();
+   if (temp == 0xCA) { // Si llega el encabezado, reiniciamos siempre
+      b_alto = 0;
+      i = 0;
+   }
+   else if (!b_alto) { // Solo si ya vimos el 0xCA empezamos a llenar instruccion
+      instruccion[i] = temp;
+      i++;
+      if(i == 3) {
+         duty_recibido = make16(instruccion[1], instruccion[2]);
+         nueva_instruccion = 1;
+         b_alto = 1;
+         i = 0;
+      }
+   }*/
+}
+   
+
+//-----Código Principal-----------//
+void main(){
+   setup();
+   while (true){
+      restart_wdt();
+      printResults();
+      
+      if(nueva_instruccion) {
+    
+         switch (instruccion[1]){ 
+            case 0xF0:
+               output_high(FW); output_low(BW);
+               break;
+            case 0xBA:
+               output_low(FW); output_high(BW);
+               break;
+            default:
+               output_low(FW); output_low(BW);
+         }
+         
+         duty_recibido = make16(instruccion[2], instruccion[3]);
+         
+         if(duty_recibido > 964) duty_recibido = 964; 
+         
+         set_pwm1_duty(duty_recibido);
+         nueva_instruccion = 0;
+         restart_wdt();
+      }
+   }
+}
+
+
+void setup(){
+   set_tris_b(0xFF); 
+   
+   setup_timer_0(RTCC_INTERNAL|RTCC_DIV_1);
+   setup_timer_2(T2_DIV_BY_1,240,1);
+   setup_ccp1(ccp_pwm);
+   set_pwm1_duty(0);
+
+   
+   enable_interrupts(global);
+   enable_interrupts(int_rb);
+   enable_interrupts(INT_TIMER0);
+   enable_interrupts(INT_RDA);
+   
+   
+   printf("Estoy en linea");
+}
+
+void printResults(){
+  if(flag){ 
+  
+      //printf("Duty Recibido: %ld\n\r",duty_recibido);
+      
+      posH = (int8)(pos >> 8);
+      posL = (int8)(pos & 0x00FF);
+      
+      cuentaEncH = (int8)(cuentaEnc >> 8);
+      cuentaEncL = (int8)(cuentaEnc & 0x00FF);
+      
+      //(5 bytes en total)
+      putc(0xCA);        // Byte de encabezado 
+      putc(posH);        // Posición High
+      putc(posL);        // Posición Low
+      putc(cuentaEncH);  // Pasos High
+      putc(cuentaEncL);  // Pasos Low
+      
+      cuentaEnc = 0;     // Resetear contador para el siguiente ciclo
+      flag = 0;   
+      restart_wdt();
+   };
+}
+
+
+
+
+
+
+/* #int_rb //Esta es una interrupción que se activa al haber un cambio logico en el puerto B de b4 a B7
+void rb_isr()
+{
+
+puerto=PORTB; //Obtenemos el valor del puerto B, ej: 1011 0001 
+/* 
+AB=((puerto)&(0x30))>>4; //Enmascaramos para obtener solo B5 y B4, ej:
+                         //   1011 0001
+                         //  &0011 0000  (0x30)
+                         // -------------
+                         //   0011 0000   >> 4  = 0011       
+aux=AB^AB_1;   //XOR:  Compara el estado actual con el estado anterior, si son iguales          
+if(aux!=0)     //      el reultado es 00 (aux=0, el motor no se ha movido), mientras q
+   if(aux!=3)  //      si aux=3, se ha detectado un "salto" en la secuencia del encoder (funciona como filtro); Ej: 10     ^     01       = 11 
+               //                                                                                                   Paso1  XOR   Paso3    = 3 en decimal
+      if(((AB_1<<1)^AB)&(0x02)){ // Aquí se determina el sentido de giro del motor
+    
+      cuenta1--;
+      }
+      else{
+      cuenta1++;
+      }
+      
+AB_1=AB;
+
+Esto es para un segundo encoder.*/
+
+/*
+BC=((puerto)&(0xC0))>>6;
+aux=BC^BC_1;
+if(aux!=0)
+   if(aux!=3)
+   if(((BC_1<<1)^BC)&(0x02))
+   {
+      cuenta--;
+      cuentaEnc++;
+      if(pos < MAX_ENCODER) pos++;
+      else pos=0;
+   }
+   else
+   {
+      cuenta++;
+      cuentaEnc++;
+      if(pos > 0) pos--;
+      else pos=MAX_ENCODER;
+   }
+BC_1=BC;
+FlagEnc=1; */
